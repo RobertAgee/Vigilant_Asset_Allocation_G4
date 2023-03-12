@@ -1,0 +1,381 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © jamiedubauskas and CubanEmissary
+
+// Special thanks to @VolSwan for suggesting this strategy!
+// Special thanks to @CubanEmissary for inital strategy code
+// Special thinks to @jamiedubauskas for the final polish and adding backtesting metrics
+
+// Vigilant Asset Allocation G4 (VAA G4) is a dual-momentum based investment strategy that aggressively monitors the market and reallocates portfolio funds based on
+// the relative momentums of risk assets and safety assets.  It was created by Wouter Keller and JW Keuning, based on their paper "Breadth Momentum and Vigilant 
+// Asset Allocation."  In contrast to traditional dual momentum strategies, VAA G4 monitors the market itself through the two asset types.  When all risk assets have 
+// positive momentum, the portfolio is allocated entirely into the risk asset with the strongest momentum  At any other time, the portfolio is allocated entirely 
+// into the safety asset with the strongest momentum. The combination of breadth momentum with a very defensive reallocation trigger results in a strategy which captures
+// alpha consistently.
+
+// The Strategy Rules:
+// On each monthly close...
+// 1. Calculate momentum scores for each asset.
+// momentumScore = (12*(currentMonthlyClose/lastMonthlyClose))+(4*(currentMonthlyClose/thirdLastMonthlyClose))+(2*(currentMonthlyClose/sixthLastMonthlyClose))+(currentMonthlyClose/twelvethLastMonthlyClose)-19
+// 2. If all risk asset momentums are positive, allocate entire portfolio to the strongest momentum risk asset.
+// 3. If any risk asset momentum is negative, allocate entire portfolio to the strongest momentum safety asset.
+// 4. Reevaluate at the end of each month.
+
+//@version=5
+indicator("Vigilant Asset Allocation G4 Backtesting Engine", overlay=false, max_bars_back = 5000)
+
+// keeping track of the current monthly holding
+varip current_holding = "none"
+varip prev_holding = "none"
+
+// checking if it is the start of a new month
+bool is_new_month = month[1] != month
+
+// input for starting cash
+starting_cash = input.float(title = "Starting Cash", defval = 100000.0, minval = 0.0)
+
+// keeping track of the returns
+varip cum_return = starting_cash
+varip spy_return = starting_cash
+
+// calculate total trades and max drawdown
+varip total_trades = 0
+varip model_ath = starting_cash
+varip model_max_drawdown = 0.0
+varip spy_ath = starting_cash
+varip spy_max_drawdown = 0.0
+
+// input for asking if you want to see a comparison of the model to a buy and hold of SPY
+show_spy_comparison = input.bool(title = "Show SPY", defval = true, tooltip = "Show the performance of SPY against this model to compare the performance of this model to a buy & hold")
+
+// inputs for the timeframe, lookback periods, and the ticker requests
+timeframe_i = input.timeframe(title = "Timeframe", defval = "1M")
+
+// inputs for the risk and safety tickers
+risk_ticker1_sym = input.string(title = "Risk Ticker 1 Symbol", defval = "SPY")
+risk_ticker2_sym = input.string(title = "Rick Ticker 2 Symbol", defval = "EFA")
+risk_ticker3_sym = input.string(title = "Rick Ticker 3 Symbol", defval = "EEM")
+risk_ticker4_sym = input.string(title = "Rick Ticker 4 Symbol", defval = "AGG")
+safety_ticker1_sym = input.string(title = "Safety Ticker 1 Symbol", defval = "LQD")
+safety_ticker2_sym = input.string(title = "Safety Ticker 2 Symbol", defval = "IEF")
+safety_ticker3_sym = input.string(title = "Safety Ticker 3 Symbol", defval = "BIL")
+
+// getting the monthly values of the tickers for daily backtesting
+risk_ticker1 = request.security(symbol = risk_ticker1_sym, timeframe = timeframe_i, expression = close)
+risk_ticker2 = request.security(symbol = risk_ticker2_sym, timeframe = timeframe_i, expression = close)
+risk_ticker3 = request.security(symbol = risk_ticker3_sym, timeframe = timeframe_i, expression = close)
+risk_ticker4 = request.security(symbol = risk_ticker4_sym, timeframe = timeframe_i, expression = close)
+safety_ticker1 = request.security(symbol = safety_ticker1_sym, timeframe = timeframe_i, expression = close)
+safety_ticker2 = request.security(symbol = safety_ticker2_sym, timeframe = timeframe_i, expression = close)
+safety_ticker3 = request.security(symbol = safety_ticker3_sym, timeframe = timeframe_i, expression = close)
+
+// grabbing SPY ticker info for a comparison to a buy & hold
+spy_ticker = request.security(symbol = "SPY", timeframe = timeframe_i, expression = close)
+
+// getting daily returns for backtesting (I tried this and TradingView says I was referencing too much data so daily backtesting is a bust)
+//daily_return_risk_ticker1 = ((risk_ticker1[0] / risk_ticker1[1]) - 1) * 100
+//daily_return_risk_ticker2 = ((risk_ticker2[0] / risk_ticker2[1]) - 1) * 100
+//daily_return_risk_ticker3 = ((risk_ticker3[0] / risk_ticker3[1]) - 1) * 100
+//daily_return_risk_ticker4 = ((risk_ticker4[0] / risk_ticker4[1]) - 1) * 100
+//daily_return_safety_ticker1 = ((safety_ticker1[0] / safety_ticker1[1]) - 1) * 100
+//daily_return_safety_ticker2 = ((safety_ticker2[0] / safety_ticker2[1]) - 1) * 100
+//daily_return_safety_ticker3 = ((safety_ticker3[0] / safety_ticker3[1]) - 1) * 100
+
+monthly_return_risk_ticker1 = ((risk_ticker1[0] / risk_ticker1[1]) - 1) * 100
+monthly_return_risk_ticker2 = ((risk_ticker2[0] / risk_ticker2[1]) - 1) * 100
+monthly_return_risk_ticker3 = ((risk_ticker3[0] / risk_ticker3[1]) - 1) * 100
+monthly_return_risk_ticker4 = ((risk_ticker4[0] / risk_ticker4[1]) - 1) * 100
+monthly_return_safety_ticker1 = ((safety_ticker1[0] / safety_ticker1[1]) - 1) * 100
+monthly_return_safety_ticker2 = ((safety_ticker2[0] / safety_ticker2[1]) - 1) * 100
+monthly_return_safety_ticker3 = ((safety_ticker3[0] / safety_ticker3[1]) - 1) * 100
+
+monthly_return_spy = ((spy_ticker[0] / spy_ticker[1]) - 1) * 100
+
+// calculate momentum scores for each risk asset
+momentumScoreRiskAsset1 = (12*(risk_ticker1/risk_ticker1[1]))+(4*(risk_ticker1/risk_ticker1[3]))+(2*(risk_ticker1/risk_ticker1[6]))+(risk_ticker1/risk_ticker1[12])-19
+momentumScoreRiskAsset2 = (12*(risk_ticker2/risk_ticker2[1]))+(4*(risk_ticker2/risk_ticker2[3]))+(2*(risk_ticker2/risk_ticker2[6]))+(risk_ticker2/risk_ticker2[12])-19
+momentumScoreRiskAsset3 = (12*(risk_ticker3/risk_ticker3[1]))+(4*(risk_ticker3/risk_ticker3[3]))+(2*(risk_ticker3/risk_ticker3[6]))+(risk_ticker3/risk_ticker3[12])-19
+momentumScoreRiskAsset4 = (12*(risk_ticker4/risk_ticker4[1]))+(4*(risk_ticker4/risk_ticker4[3]))+(2*(risk_ticker4/risk_ticker4[6]))+(risk_ticker4/risk_ticker4[12])-19
+
+// calculate momentum scores for each safety asset
+momentumScoreSafetyAsset1 = (12*(safety_ticker1/safety_ticker1[1]))+(4*(safety_ticker1/safety_ticker1[3]))+(2*(safety_ticker1/safety_ticker1[6]))+(safety_ticker1/safety_ticker1[12])-19
+momentumScoreSafetyAsset2 = (12*(safety_ticker2/safety_ticker2[1]))+(4*(safety_ticker2/safety_ticker2[3]))+(2*(safety_ticker2/safety_ticker2[6]))+(safety_ticker2/safety_ticker2[12])-19
+momentumScoreSafetyAsset3 = (12*(safety_ticker3/safety_ticker3[1]))+(4*(safety_ticker3/safety_ticker3[3]))+(2*(safety_ticker3/safety_ticker3[6]))+(safety_ticker3/safety_ticker3[12])-19
+
+// calculate maximum momentum score of each asset type
+maxRiskAssetMomentumScore = math.max(momentumScoreRiskAsset1, momentumScoreRiskAsset2, momentumScoreRiskAsset3, momentumScoreRiskAsset4)
+maxSafetyAssetMomentumScore = math.max(momentumScoreSafetyAsset1, momentumScoreRiskAsset2, momentumScoreRiskAsset3)
+
+// determine which asset of each type has the highest momentum score
+highestMomentumScoreRiskAsset = (momentumScoreRiskAsset1 == maxRiskAssetMomentumScore) ? risk_ticker1_sym : (momentumScoreRiskAsset2 == maxRiskAssetMomentumScore) ? risk_ticker2_sym : (momentumScoreRiskAsset3 == maxRiskAssetMomentumScore) ? risk_ticker3_sym : risk_ticker4_sym
+highestMomentumScoreSafetyAsset = (momentumScoreSafetyAsset1 == maxSafetyAssetMomentumScore) ? safety_ticker1_sym : (momentumScoreSafetyAsset2 == maxSafetyAssetMomentumScore) ? safety_ticker2_sym : safety_ticker3_sym
+
+// grabbing the monthly close of the highestMomentumScoreRiskAsset and highestMomentumScoreSafetyAsset
+highestMomentumScoreRiskAssetDailyClose = switch highestMomentumScoreRiskAsset
+    risk_ticker1_sym => risk_ticker1[0]
+    risk_ticker2_sym => risk_ticker2[0]
+    risk_ticker3_sym => risk_ticker3[0]
+    risk_ticker4_sym => risk_ticker4[0]
+
+highestMomentumScoreSafetyAssetDailyClose = switch highestMomentumScoreSafetyAsset
+    safety_ticker1_sym => safety_ticker1[0]
+    safety_ticker2_sym => safety_ticker2[0]
+    safety_ticker3_sym => safety_ticker3[0]
+
+// setting the color of the line
+useRainbowColoring = input.bool(title = "Use Rainbow Coloring?", defval = true, tooltip = "Enables you to see the color of the respective ticker in the equity curve")
+risk_ticker1_color = input.color(title = "Risk Ticker 1 Color", defval = color.new(color.red, 0))
+risk_ticker2_color = input.color(title = "Risk Ticker 2 Color", defval = color.new(color.aqua, 0))
+risk_ticker3_color = input.color(title = "Risk Ticker 3 Color", defval = color.new(color.green, 0))
+risk_ticker4_color = input.color(title = "Risk Ticker 4 Color", defval = color.new(color.yellow, 0))
+safety_ticker1_color = input.color(title = "Safety Ticker 1 Color", defval = color.new(color.purple, 0))
+safety_ticker2_color = input.color(title = "Safety Ticker 2 Color", defval = color.new(color.maroon, 0))
+safety_ticker3_color = input.color(title = "Safety Ticker 3 Color", defval = color.new(color.olive, 0))
+def_color = input.color(title = "Default Color", defval = color.new(color.white, 0))
+
+// setting current holding
+// risk-on entry signal occurs when the momentum of each risk asset is greater than 0
+if(momentumScoreRiskAsset1 > 0 and momentumScoreRiskAsset2 > 0 and momentumScoreRiskAsset3 > 0 and momentumScoreRiskAsset4 > 0) and is_new_month
+    // determine if there is already a position open
+    if(current_holding != "none")
+        // if current holding string matches, (i.e. position is already held), just set the previous holding
+        if(current_holding == highestMomentumScoreRiskAsset)
+            prev_holding := current_holding
+        // if current holding string does not match, set it to the current highest momentum risk asset
+        else if(current_holding != highestMomentumScoreRiskAsset)
+            prev_holding := current_holding
+            current_holding := highestMomentumScoreRiskAsset
+            total_trades += 1
+    // if no position is currently held, maximally invest in highest momentum risk asset
+    else
+        current_holding := highestMomentumScoreRiskAsset
+        total_trades += 1
+
+// risk-off entry signal occurs when any of the risk asset momentums are less than 0
+else if(momentumScoreRiskAsset1 < 0 or momentumScoreRiskAsset2 < 0 or momentumScoreRiskAsset3 < 0 or momentumScoreRiskAsset4 < 0) and is_new_month
+    // determine if there is already a position open
+    if(current_holding != "none")
+        // if current holding string matches, (i.e. position is already held), just set the previous holding
+        if(current_holding == highestMomentumScoreSafetyAsset)
+            prev_holding := current_holding
+        // if current holding string does not match, close open position and reopen in current highest momentum safety asset
+        if(current_holding != highestMomentumScoreSafetyAsset)
+            prev_holding := current_holding
+            current_holding := highestMomentumScoreSafetyAsset
+            total_trades += 1
+    // if no position is currently held, maximally invest in highest momentum safety asset
+    else
+        current_holding := highestMomentumScoreSafetyAsset
+        total_trades += 1
+
+// grabbing the bars since the last month change
+//since_month_change = ta.barssince()
+
+
+// input for trading fees
+trading_fee_input = input.float(title = "Trading Fee %", defval = 0.0)
+trading_fee = 1 - (trading_fee_input / 100)
+
+// boolean expression to check if all tickers have "started"
+start_time = input.time(title = "Model Start", defval = timestamp("02 June 2008 00:00 +300"))
+all_start = (time(timeframe_i) >= start_time)
+
+// getting the bar count of the model
+model_bar_count = ta.cum(all_start ? 1 : 0)
+int current_model_bar_count = all_start ? math.round(model_bar_count[0]) : 1
+
+// ***********************************************************
+//
+//          MODEL AND CALCULATING STATS ON IT
+//
+// ***********************************************************
+
+if current_holding == "none" and all_start
+    cum_return := starting_cash
+else if current_holding == risk_ticker1_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker1[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker1[0] / 100) + 1) * trading_fee
+else if current_holding == risk_ticker2_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker2[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker2[0] / 100) + 1) * trading_fee
+else if current_holding == risk_ticker3_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker3[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker3[0] / 100) + 1) * trading_fee
+else if current_holding == risk_ticker4_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker4[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_risk_ticker4[0] / 100) + 1) * trading_fee
+else if current_holding == safety_ticker1_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker1[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker1[0] / 100) + 1) * trading_fee
+else if current_holding == safety_ticker2_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker2[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker2[0] / 100) + 1) * trading_fee
+else if current_holding == safety_ticker3_sym and all_start
+    if prev_holding == current_holding
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker3[0] / 100) + 1)
+    else
+        cum_return := cum_return[1] * ((monthly_return_safety_ticker3[0] / 100) + 1) * trading_fee
+
+
+// calculating the sharpe ratio and grabbing the risk free rate
+risk_free_rate_selection = input.string(title = "Risk Free Rate", options = ["Standard 2%","3M TBill","6M TBill","1Y TBill","2Y TBill","3Y TBill","5Y TBill","10Y TBill","30Y TBill"], defval = "Standard 2%", tooltip = "The risk free rate used when calculating Sharpe & Sortino Ratio.")
+risk_free_rate_selection_ticker = switch risk_free_rate_selection
+    "Standard 2%" => "2"
+    "3M TBill" => "DTB3"
+    "6M TBill" => "DTB6"
+    "1Y TBill" => "DTB1YR"
+    "2Y TBill" => "DGS2"
+    "3Y TBill" => "DGS3"
+    "5Y TBill" => "DGS5"
+    "10Y TBill" => "DGS10"
+    "30Y TBill" => "DGS30"
+risk_free_rate = risk_free_rate_selection_ticker == "2" ? 0.02 : request.security(symbol = risk_free_rate_selection_ticker, timeframe = timeframe_i, expression = close / 100)
+
+// based on number of trading years since inception (a.k.a based on 252 trading days in a year)
+num_of_years_since_inception = current_model_bar_count / 12
+model_average_return = math.pow(cum_return[0] / cum_return[current_model_bar_count], (1 / num_of_years_since_inception)) - 1
+//plot(model_average_return, color = color.new(color.blue,0))
+
+// hand-calculating standard deviation for Sharpe Ratio
+model_1yr_pnl = current_model_bar_count > 12 ? (cum_return[0] / cum_return[11]) - 1 : model_average_return
+model_variation_squared = math.pow((model_1yr_pnl - model_average_return), 2)
+model_total_variation_squared = math.sum(model_variation_squared, 12)
+
+model_stddev = math.sqrt(model_total_variation_squared / current_model_bar_count)
+//raw_model_stddev = ta.stdev(raw_cum_return, 365)
+sharpe_ratio = (model_average_return - risk_free_rate) / model_stddev
+//plot(sharpe_ratio, color = color.new(color.blue,0))
+
+// getting Sortino Ratio
+model_average_downside_return = model_average_return
+if model_average_return > 0
+    model_average_downside_return := 0
+else
+    model_average_downside_return := model_average_return
+
+sortino_std_dev = ta.stdev(model_average_downside_return, current_model_bar_count)
+sortino_ratio = (model_average_return - risk_free_rate) / sortino_std_dev
+//plot(sortino_ratio, color = color.new(color.purple,0))
+
+// getting CAGR (already calculated it as model_average_return bc its the same formula)
+cagr = model_average_return * 100
+
+// calculating the drawdown
+if cum_return[0] > model_ath
+    model_ath := cum_return[0]
+
+model_drawdown = ((cum_return / model_ath) - 1) * 100
+if model_drawdown[0] < model_max_drawdown
+    model_max_drawdown := model_drawdown[0]
+
+// ***********************************************************
+//
+//      STANDARDIZED SPY AND CALCULATING STATS ON IT
+//
+// ***********************************************************
+
+// getting the daily return of spy
+if all_start
+    spy_return := ((monthly_return_spy / 100) + 1) * spy_return[1]
+
+spy_average_return = math.pow(spy_return[0] / spy_return[current_model_bar_count], (1 / num_of_years_since_inception)) - 1
+
+// hand-calculating standard deviation for Sharpe Ratio
+spy_1yr_pnl = current_model_bar_count > 12 ? (spy_return[0] / spy_return[11]) - 1 : spy_average_return
+spy_variation_squared = math.pow((spy_1yr_pnl - spy_average_return), 2)
+spy_total_variation_squared = math.sum(spy_variation_squared, 12)
+
+spy_stddev = math.sqrt(spy_total_variation_squared / current_model_bar_count)
+spy_sharpe_ratio = (spy_average_return - risk_free_rate) / spy_stddev
+
+// getting Sortino Ratio
+spy_average_downside_return = spy_average_return
+if spy_average_return > 0
+    spy_average_downside_return := 0
+else
+    spy_average_downside_return := spy_average_return
+
+spy_sortino_std_dev = ta.stdev(spy_average_downside_return, current_model_bar_count)
+spy_sortino_ratio = (spy_average_return - risk_free_rate) / spy_sortino_std_dev
+spy_cagr = spy_average_return * 100
+
+// calculating the drawdown
+if spy_return[0] > spy_ath
+    spy_ath := spy_return[0]
+
+spy_drawdown = ((spy_return / spy_ath) - 1) * 100
+if spy_drawdown[0] < spy_max_drawdown
+    spy_max_drawdown := spy_drawdown[0]
+
+// ***********************************************************
+//
+//    PLOTTING ANALYTICS TABLE AND CHARTS FOR ALL MODELS
+//
+// ***********************************************************
+
+// plotting the analytics table
+var analytics_table = table.new(position = position.bottom_right, columns = 3, rows = 6, frame_color = color.new(color.white, 0), frame_width = 2, border_width = 1, border_color = color.new(color.white,0))
+if barstate.islast
+    // setting the labels of the table
+    table.cell(table_id = analytics_table, column = 0, row = 0, text = "Trading Model Stats", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 1, row = 0, text = "Model", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 2, row = 0, text = "SPY", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 0, row = 1, text = "CAGR", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 0, row = 2, text = "# of Trades", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 0, row = 3, text = "Max Drawdown", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 0, row = 4, text = "Sharpe Ratio", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    table.cell(table_id = analytics_table, column = 0, row = 5, text = "Sortino Ratio", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.small)
+    
+    // setting the values of the table for the raw model statistics
+    table.cell(table_id = analytics_table, column = 1, row = 1, text = str.format("{0,number,#.##}%", cagr), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 1, row = 2, text = str.tostring(total_trades), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 1, row = 3, text = str.format("{0,number,#.##}%", model_max_drawdown), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 1, row = 4, text = str.format("{0,number,#.###}", sharpe_ratio), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 1, row = 5, text = str.format("{0,number,#.###}", sortino_ratio), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+
+    // setting the values of the table for the BTC statistics
+    table.cell(table_id = analytics_table, column = 2, row = 1, text = str.format("{0,number,#.##}%", spy_cagr), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 2, row = 2, text = "-", bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 2, row = 3, text = str.format("{0,number,#.##}%", spy_max_drawdown), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 2, row = 4, text = str.format("{0,number,#.###}", spy_sharpe_ratio), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+    table.cell(table_id = analytics_table, column = 2, row = 5, text = str.format("{0,number,#.###}", spy_sortino_ratio), bgcolor = color.new(color.green,20), text_color = color.new(color.white,0), text_size = size.normal)
+
+holding_color = switch current_holding
+    risk_ticker1_sym => risk_ticker1_color
+    risk_ticker2_sym => risk_ticker2_color
+    risk_ticker3_sym => risk_ticker3_color
+    risk_ticker4_sym => risk_ticker4_color
+    safety_ticker1_sym => safety_ticker1_color
+    safety_ticker2_sym => safety_ticker2_color
+    safety_ticker3_sym => safety_ticker3_color
+plot_color = useRainbowColoring ? holding_color : def_color
+plot(series = cum_return, color = plot_color, title = "Model")
+plot(series = all_start and show_spy_comparison ? spy_return : na, color = color.new(color.white,0), title = "SPY")
+
+// ***********************************************************
+//
+//      MAKING TRADINGVIEW ALERTS FOR THE STRATEGY
+//
+// ***********************************************************
+
+// alert for ticker1 outperforming
+//if ticker1_outperf_crossover
+//    alert(freq = alert.freq_once_per_bar_close, message = "Ticker 1 (" + str.tostring(ticker1_sym) + ") is outperforming. BUY")
+
+// alert for ticker2 outperforming
+//if ticker2_outperf_crossover
+//    alert(freq = alert.freq_once_per_bar_close, message = "Ticker 2 (" + str.tostring(ticker2_sym) + ") is outperforming. BUY")
+
+
+
